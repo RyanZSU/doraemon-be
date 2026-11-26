@@ -256,7 +256,9 @@ curl https://<app>.azurewebsites.net/api/health
 - Secrets：`AZURE_CLIENT_ID`、`AZURE_TENANT_ID`、`AZURE_SUBSCRIPTION_ID`
 - Variable：`AZURE_WEBAPP_NAME`（deploy.ps1 输出）
 
-之后推送 `main` 会触发 `.github/workflows/deploy.yml`：CI 校验 → 上传构建产物 → OIDC 登录 → Zip 部署。
+之后推送 `main` 且改动命中 `src/**`、`package*.json`、`tsconfig*.json`、`nest-cli.json` 或 `.github/workflows/deploy.yml` 时会自动部署。纯文档/部署脚本的推送只跑 CI，不会重启应用（F1 的 CPU 与停止配额有限）；需要时可在 GitHub Actions 页面手动运行 **Deploy to Azure App Service → Run workflow**。
+
+部署流程：安装依赖 + lint + 单测 + 构建 → 上传产物 → 检查 secrets/variables → OIDC 登录 → Zip 部署 → 轮询 `/api/health`，3 分钟内未就绪则 workflow 失败。`AZURE_WEBAPP_NAME` 未配置时会在部署前给出明确报错。
 
 ### 4. 小程序侧配置
 

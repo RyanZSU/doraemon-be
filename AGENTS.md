@@ -133,6 +133,9 @@ deploy/                         Bicep, parameter files, deploy/OIDC scripts
     moving secrets to Key Vault is a planned follow-up.
 - CI/CD targets `vars.AZURE_WEBAPP_NAME` and uses OIDC secrets
   `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`.
+- The deploy workflow only triggers for app-code paths (or manual
+  `workflow_dispatch`), deliberately skipping docs-only pushes to save F1
+  quota. It verifies `/api/health` after deploying and fails on a non-200.
 - Deployment failures and quota issues are documented in the README
   troubleshooting section; add new recurring failure modes there.
 
