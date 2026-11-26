@@ -60,37 +60,62 @@ else {
     Write-Host 'Website Contributor role assignment already exists'
 }
 
-$credentials = az ad app federated-credential list --id $appId --query "[].name" --output json | ConvertFrom-Json
+$credentialsJson = az ad app federated-credential list `
+    --id $appId `
+    --query "[].{name:name,issuer:issuer,subject:subject,audiences:audiences}" `
+    --output json
+if ($LASTEXITCODE -ne 0) { throw 'Could not list federated credentials.' }
+# Windows PowerShell 5.1 returns a JSON array as a single pipeline object;
+# assign first, then wrap, so Where-Object sees each credential individually.
+$credentialsParsed = $credentialsJson | ConvertFrom-Json
+$credentials = @($credentialsParsed)
+
+# Use ${...} around variables followed by a colon: PowerShell otherwise parses
+# "$GitHubRepository:environment" as a scope-qualified variable name.
 $credentialSpecs = @(
     @{
         Name    = "github-branch-$Branch"
-        Subject = "repo:$GitHubRepository:ref:refs/heads/$Branch"
+        Subject = "repo:${GitHubRepository}:ref:refs/heads/$Branch"
     },
     @{
         Name    = "github-environment-$EnvironmentName"
-        Subject = "repo:$GitHubRepository:environment:$EnvironmentName"
+        Subject = "repo:${GitHubRepository}:environment:$EnvironmentName"
     }
 )
 
 foreach ($spec in $credentialSpecs) {
-    if ($credentials -contains $spec.Name) {
-        Write-Host "Federated credential '$($spec.Name)' already exists"
-        continue
-    }
-
+    $audience = 'api://AzureADTokenExchange'
     $body = @{
         name      = $spec.Name
         issuer    = 'https://token.actions.githubusercontent.com'
         subject   = $spec.Subject
-        audiences = @('api://AzureADTokenExchange')
+        audiences = @($audience)
     } | ConvertTo-Json -Depth 5
 
-    $tempFile = Join-Path $env:TEMP "$($spec.Name).json"
-    Set-Content -Path $tempFile -Value $body -Encoding utf8
-    try {
+    $existing = $credentials | Where-Object { $_.name -eq $spec.Name } | Select-Object -First 1
+    if ($existing) {
+        $audienceMatches = (($existing.audiences | Sort-Object) -join ',') -eq $audience
+        if ($existing.subject -eq $spec.Subject -and
+            $existing.issuer -eq 'https://token.actions.githubusercontent.com' -and
+            $audienceMatches) {
+            Write-Host "Federated credential '$($spec.Name)' already exists and matches"
+            continue
+        }
+        Write-Host "Updating federated credential '$($spec.Name)' (subject was '$($existing.subject)')"
+        $verb = 'update'
+        $verbArgs = @('--federated-credential-id', $spec.Name)
+    }
+    else {
         Write-Host "Creating federated credential '$($spec.Name)' ($($spec.Subject))"
-        az ad app federated-credential create --id $appId --parameters $tempFile --output none
-        if ($LASTEXITCODE -ne 0) { throw "Failed to create federated credential $($spec.Name)." }
+        $verb = 'create'
+        $verbArgs = @()
+    }
+
+    $tempFile = Join-Path $env:TEMP "$($spec.Name).json"
+    [IO.File]::WriteAllText($tempFile, $body, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        az ad app federated-credential $verb --id $appId @verbArgs --parameters $tempFile --output none
+        if ($LASTEXITCODE -ne 0) { throw "Failed to $verb federated credential $($spec.Name)." }
     }
     finally {
         Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
