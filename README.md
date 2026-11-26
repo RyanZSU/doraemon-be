@@ -251,7 +251,11 @@ curl https://<app>.azurewebsites.net/api/health
 .\deploy\scripts\setup-oidc.ps1 -GitHubRepository <owner/repo> -ResourceGroup rg-doraemon-be-dev
 ```
 
-脚本创建 Entra 应用 + 服务主体 + 联合凭据（分支 `main` 与环境 `production`），并授予资源组级 **Website Contributor**。然后按输出设置 GitHub：
+脚本创建 Entra 应用 + 服务主体 + 联合凭据（分支 `main` 与环境 `production`），并授予资源组级 **Website Contributor**。
+
+> GitHub 自 2026-07-15 起对新仓库使用**不可变 OIDC subject**（`repo:OWNER@OWNER-ID/REPO@REPO-ID:...`）。脚本会通过 GitHub API 自动获取 owner/repo ID；私有仓库需先设置 `GITHUB_TOKEN`，或显式传 `-GitHubOwnerId` / `-GitHubRepositoryId`。2026-07-15 之前创建且未启用不可变 subject 的仓库，加 `-LegacySubject`。
+
+然后按输出设置 GitHub：
 
 - Secrets：`AZURE_CLIENT_ID`、`AZURE_TENANT_ID`、`AZURE_SUBSCRIPTION_ID`
 - Variable：`AZURE_WEBAPP_NAME`（deploy.ps1 输出）

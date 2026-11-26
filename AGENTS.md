@@ -133,6 +133,10 @@ deploy/                         Bicep, parameter files, deploy/OIDC scripts
     moving secrets to Key Vault is a planned follow-up.
 - CI/CD targets `vars.AZURE_WEBAPP_NAME` and uses OIDC secrets
   `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`.
+- OIDC subjects depend on the repository's immutable-subject setting: repos
+  created after 2026-07-15 use
+  `repo:OWNER@OWNER-ID/REPO@REPO-ID:environment:ENV` (and `:ref:refs/heads/main`).
+  `setup-oidc.ps1` auto-detects the IDs; don't hand-write legacy subjects.
 - The deploy workflow only triggers for app-code paths (or manual
   `workflow_dispatch`), deliberately skipping docs-only pushes to save F1
   quota. It verifies `/api/health` after deploying and fails on a non-200.

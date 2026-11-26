@@ -6,7 +6,15 @@ param(
     [string]$ResourceGroup = 'rg-doraemon-be-dev',
     [string]$Branch = 'main',
     [string]$EnvironmentName = 'production',
-    [string]$DisplayName = 'doraemon-be-github-actions'
+    [string]$DisplayName = 'doraemon-be-github-actions',
+    # Immutable OIDC subject IDs. Repositories created after 2026-07-15 include
+    # owner/repo IDs in the subject. Auto-detected through the GitHub API when
+    # omitted; for private repositories set GITHUB_TOKEN or pass both IDs.
+    [string]$GitHubOwnerId = '',
+    [string]$GitHubRepositoryId = '',
+    # Repositories created before 2026-07-15 keep the legacy subject format
+    # unless immutable subject claims were explicitly enabled.
+    [switch]$LegacySubject
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,6 +68,44 @@ else {
     Write-Host 'Website Contributor role assignment already exists'
 }
 
+$repoParts = $GitHubRepository.Split('/')
+if ($repoParts.Count -ne 2 -or
+    [string]::IsNullOrWhiteSpace($repoParts[0]) -or
+    [string]::IsNullOrWhiteSpace($repoParts[1])) {
+    throw 'GitHubRepository must be in owner/name form, e.g. someone/doraemon-be.'
+}
+
+if (-not $LegacySubject) {
+    if ([string]::IsNullOrWhiteSpace($GitHubOwnerId) -or [string]::IsNullOrWhiteSpace($GitHubRepositoryId)) {
+        try {
+            $apiHeaders = @{
+                'User-Agent' = 'doraemon-be-setup'
+                Accept       = 'application/vnd.github+json'
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+                $apiHeaders.Authorization = "Bearer $($env:GITHUB_TOKEN)"
+            }
+            $repoInfo = Invoke-RestMethod `
+                -Uri "https://api.github.com/repos/$GitHubRepository" `
+                -Headers $apiHeaders `
+                -TimeoutSec 30
+            $GitHubOwnerId = "$($repoInfo.owner.id)"
+            $GitHubRepositoryId = "$($repoInfo.id)"
+            Write-Host "Detected immutable OIDC IDs: owner=$GitHubOwnerId repo=$GitHubRepositoryId"
+        }
+        catch {
+            throw "Could not read $GitHubRepository from the GitHub API. " +
+                'For private repositories set GITHUB_TOKEN, or pass -GitHubOwnerId and -GitHubRepositoryId. ' +
+                "Repositories created before 2026-07-15 can use -LegacySubject. Error: $($_.Exception.Message)"
+        }
+    }
+    $subjectPrefix = 'repo:{0}@{1}/{2}@{3}' -f $repoParts[0], $GitHubOwnerId, $repoParts[1], $GitHubRepositoryId
+}
+else {
+    $subjectPrefix = 'repo:{0}/{1}' -f $repoParts[0], $repoParts[1]
+    Write-Warning 'Using legacy OIDC subject format. This only works for repositories that do not use immutable subject claims.'
+}
+
 $credentialsJson = az ad app federated-credential list `
     --id $appId `
     --query "[].{name:name,issuer:issuer,subject:subject,audiences:audiences}" `
@@ -70,16 +116,16 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not list federated credentials.' }
 $credentialsParsed = $credentialsJson | ConvertFrom-Json
 $credentials = @($credentialsParsed)
 
-# Use ${...} around variables followed by a colon: PowerShell otherwise parses
-# "$GitHubRepository:environment" as a scope-qualified variable name.
+# Format strings avoid the PowerShell pitfall where "$var:suffix" is parsed as
+# a scope-qualified variable name.
 $credentialSpecs = @(
     @{
         Name    = "github-branch-$Branch"
-        Subject = "repo:${GitHubRepository}:ref:refs/heads/$Branch"
+        Subject = ('{0}:ref:refs/heads/{1}' -f $subjectPrefix, $Branch)
     },
     @{
         Name    = "github-environment-$EnvironmentName"
-        Subject = "repo:${GitHubRepository}:environment:$EnvironmentName"
+        Subject = ('{0}:environment:{1}' -f $subjectPrefix, $EnvironmentName)
     }
 )
 
