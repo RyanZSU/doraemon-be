@@ -4,16 +4,21 @@ param(
     [string]$Location = 'eastasia',
     # Optional custom .bicepparam file.
     [string]$ParametersFile = '',
-    # Existing MongoDB / DocumentDB connection string (free-tier cluster created in the portal).
-    # Omit to be prompted (input hidden).
+    # Existing MongoDB / DocumentDB connection string (free-tier cluster).
+    # If omitted, .secrets\mongo-connection-string.txt is used when present, else prompted (input hidden).
     [string]$MongoConnectionString = '',
+    # Optional path to bicep.exe (otherwise discovered from PATH / %LOCALAPPDATA%\doraemon-be).
+    [string]$BicepPath = '',
     # Create a paid DocumentDB cluster with Bicep instead of reusing an existing connection string.
     [switch]$CreateMongoCluster,
+    # Use the App Service Free plan (F1, 60 CPU min/day, no Always On, no custom domain).
+    [switch]$UseFreeAppServicePlan,
+    # Validate the deployment with Azure without creating resources.
+    [switch]$ValidateOnly,
     # Build and zip-deploy the current working tree after provisioning.
     [switch]$DeployCode
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Assert-Tool {
@@ -21,6 +26,24 @@ function Assert-Tool {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "$Name not found. $Hint"
     }
+}
+
+function Resolve-Bicep {
+    param([string]$Override)
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($Override)) { $candidates += $Override }
+    if (-not [string]::IsNullOrWhiteSpace($env:BICEP_PATH)) { $candidates += $env:BICEP_PATH }
+    $cmd = Get-Command bicep -ErrorAction SilentlyContinue
+    if ($cmd) { $candidates += $cmd.Source }
+    $candidates += (Join-Path $env:LOCALAPPDATA 'doraemon-be\bicep.exe')
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+    # az bicep needs GitHub Releases; compile locally instead.
+    throw 'Bicep CLI not found. Run .\deploy\scripts\install-bicep.ps1 or pass -BicepPath.'
 }
 
 function New-RandomSecret {
@@ -33,6 +56,40 @@ function New-RandomSecret {
     }
     finally {
         $rng.Dispose()
+    }
+}
+
+function New-ZipPackage {
+    param(
+        [string]$SourceRoot,
+        [string[]]$Items,
+        [string]$Destination
+    )
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path $Destination) {
+        Remove-Item -Path $Destination -Force
+    }
+
+    $root = $SourceRoot.TrimEnd('\', '/')
+    $archive = [IO.Compression.ZipFile]::Open($Destination, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($item in $Items) {
+            $path = Join-Path $root $item
+            if (Test-Path $path -PathType Container) {
+                Get-ChildItem -Path $path -Recurse -File | ForEach-Object {
+                    $relative = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+                    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $relative) | Out-Null
+                }
+            }
+            else {
+                $relative = $item.Replace('\', '/')
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $path, $relative) | Out-Null
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
     }
 }
 
@@ -82,6 +139,7 @@ function Read-RequiredEnv {
 
 Assert-Tool 'az' 'Install with: winget install --id Microsoft.AzureCLI -e'
 Assert-Tool 'npm' 'Install Node.js 24 LTS from https://nodejs.org.'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
 $accountJson = az account show --query '{name:name,id:id}' --output json 2>$null
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($accountJson)) {
@@ -96,9 +154,17 @@ if ($CreateMongoCluster) {
     Ensure-EnvSecret -Name 'MONGO_ADMIN_PASSWORD' -Generate
 }
 else {
+    $secretFile = Join-Path $repoRoot '.secrets\mongo-connection-string.txt'
     if (-not [string]::IsNullOrWhiteSpace($MongoConnectionString)) {
         [Environment]::SetEnvironmentVariable('MONGODB_CONNECTION_STRING', $MongoConnectionString, 'Process')
     }
+    elseif ((Test-Path $secretFile) -and
+        -not [string]::IsNullOrWhiteSpace((Get-Content -Path $secretFile -Raw))) {
+        $saved = (Get-Content -Path $secretFile -Raw).Trim()
+        [Environment]::SetEnvironmentVariable('MONGODB_CONNECTION_STRING', $saved, 'Process')
+        Write-Host 'Using MongoDB connection string from .secrets\mongo-connection-string.txt'
+    }
+
     Read-RequiredEnv -Name 'MONGODB_CONNECTION_STRING' -Secret
     $conn = [Environment]::GetEnvironmentVariable('MONGODB_CONNECTION_STRING', 'Process')
     if ($conn -notmatch '^mongodb(\+srv)?://') {
@@ -109,6 +175,19 @@ else {
 Read-RequiredEnv -Name 'WECHAT_APP_ID'
 Read-RequiredEnv -Name 'WECHAT_APP_SECRET' -Secret
 [Environment]::SetEnvironmentVariable('AZURE_LOCATION', $Location, 'Process')
+
+if ($UseFreeAppServicePlan) {
+    [Environment]::SetEnvironmentVariable('APP_SERVICE_SKU', 'F1', 'Process')
+    [Environment]::SetEnvironmentVariable('APP_SERVICE_TIER', 'Free', 'Process')
+    Write-Host ''
+    Write-Host 'Using the App Service Free plan (F1):'
+    Write-Host '  - 60 CPU minutes per day; the site stops serving when the quota is used up.'
+    Write-Host '  - No Always On: the app unloads after idle and cold-starts on the next request.'
+    Write-Host '  - No custom domains: only *.azurewebsites.net, which cannot be ICP-filed for a released mini program.'
+    Write-Host '  - Health check is disabled automatically to avoid waking the app every minute.'
+    Write-Host '  Upgrade to B1 before submitting the mini program for release.'
+    Write-Host ''
+}
 
 if ([string]::IsNullOrWhiteSpace($ParametersFile)) {
     $paramsDir = Join-Path $PSScriptRoot '..\params'
@@ -135,12 +214,47 @@ if ($rgExists -ne 'true') {
 $deploymentName = "doraemon-be-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 Write-Host "Deploying infrastructure (deployment: $deploymentName)..."
 
-az deployment group create `
-    --resource-group $ResourceGroup `
-    --name $deploymentName `
-    --parameters $resolvedParams `
-    --output none
-if ($LASTEXITCODE -ne 0) { throw 'Infrastructure deployment failed.' }
+$bicepCli = Resolve-Bicep -Override $BicepPath
+$templatePath = Join-Path $env:TEMP "$deploymentName.main.json"
+$compiledParamsPath = Join-Path $env:TEMP "$deploymentName.params.json"
+
+try {
+    # Compile locally so az does not need its own Bicep CLI (which downloads from GitHub Releases).
+    & $bicepCli build (Join-Path $PSScriptRoot '..\main.bicep') --outfile $templatePath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Bicep template compilation failed.' }
+
+    & $bicepCli build-params $resolvedParams --outfile $compiledParamsPath | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Bicep parameter compilation failed.' }
+
+    if ($ValidateOnly) {
+        az deployment group validate `
+            --resource-group $ResourceGroup `
+            --name $deploymentName `
+            --template-file $templatePath `
+            --parameters "@$compiledParamsPath" `
+            --output none
+        if ($LASTEXITCODE -ne 0) { throw 'Validation failed.' }
+    }
+    else {
+        az deployment group create `
+            --resource-group $ResourceGroup `
+            --name $deploymentName `
+            --template-file $templatePath `
+            --parameters "@$compiledParamsPath" `
+            --output none
+        if ($LASTEXITCODE -ne 0) { throw 'Infrastructure deployment failed.' }
+    }
+}
+finally {
+    Remove-Item -Path $templatePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $compiledParamsPath -Force -ErrorAction SilentlyContinue
+}
+
+if ($ValidateOnly) {
+    Write-Host ''
+    Write-Host 'Validation succeeded. No resources were created.'
+    return
+}
 
 $outputsJson = az deployment group show `
     --resource-group $ResourceGroup `
@@ -162,7 +276,6 @@ Write-Host "  Health check : $healthUrl"
 Write-Host "  Mongo cluster: $($outputs.mongoClusterName.value)"
 
 if ($DeployCode) {
-    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
     Push-Location $repoRoot
     try {
         Write-Host 'Installing dependencies...'
@@ -185,7 +298,10 @@ if ($DeployCode) {
             'dist'
         )
         Write-Host "Packaging $zipPath"
-        Compress-Archive -Path $items -DestinationPath $zipPath -Force
+        # Compress-Archive in Windows PowerShell 5.1 writes backslash-separated
+        # entry names, which Linux unzip turns into single filenames. Use .NET so
+        # the archive uses standard forward slashes.
+        New-ZipPackage -SourceRoot $repoRoot -Items $items -Destination $zipPath
 
         Write-Host 'Deploying code (App Service will run npm install && npm run build)...'
         az webapp deploy `
@@ -208,5 +324,5 @@ if ($DeployCode) {
 Write-Host ''
 Write-Host 'Next steps:'
 Write-Host "  1. Check health: curl $healthUrl"
-Write-Host '  2. Configure the mini program request domain / request legal域名 with the App Service hostname.'
+Write-Host '  2. Configure the mini program request legal domain with the App Service hostname.'
 Write-Host "  3. Optional CI/CD: .\deploy\scripts\setup-oidc.ps1 -GitHubRepository <owner/repo> -ResourceGroup $ResourceGroup"

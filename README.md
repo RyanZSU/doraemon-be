@@ -50,6 +50,8 @@ deploy/
   modules/                     App Service、DocumentDB 集群
   params/dev.bicepparam        从环境变量读取密钥
   scripts/deploy.ps1           一键创建资源 + 可选部署代码
+  scripts/create-free-mongo.ps1 创建 DocumentDB Free Tier 集群并保存连接串
+  scripts/install-bicep.ps1    从 NuGet 安装 Bicep CLI（GitHub 不可达时可用）
   scripts/setup-oidc.ps1       配置 GitHub Actions OIDC
 .github/workflows/             CI（lint/test/build）与部署
 ```
@@ -146,10 +148,16 @@ POST /api/auth/login
 ### 0. 前置
 
 - Azure 订阅；`az login` 已登录。
-- 安装 Azure CLI（可选 Bicep CLI 用于本地校验）：
+- 安装 Azure CLI：
 
 ```powershell
 winget install --id Microsoft.AzureCLI -e
+```
+
+- 安装 Bicep CLI（部署脚本在本地编译 Bicep，不依赖 `az bicep`）：
+
+```powershell
+.\deploy\scripts\install-bicep.ps1
 ```
 
 - 准备微信小程序 `AppID` / `AppSecret`。
@@ -160,19 +168,34 @@ winget install --id Microsoft.AzureCLI -e
 
 #### 方式 A：复用 DocumentDB Free Tier 连接串（当前推荐）
 
-1. 在 Azure 门户创建 **Azure DocumentDB Free Tier** 集群（每订阅一个，32 GB；选择 East Asia 或 Japan East），在 Networking 中允许 Azure 服务访问（`0.0.0.0` 防火墙规则），从「连接字符串」页复制完整 `mongodb+srv://...` 串。免费层 60 天无活动会自动暂停。
+1. 创建免费层集群（二选一，每订阅一个，32 GB，免费层 60 天无活动会暂停）：
+
+```powershell
+# 自动创建（East Asia，禁用 HA，开放 Azure 服务防火墙）
+# 需要先运行 install-bicep.ps1；连接串会写入 .secrets/mongo-connection-string.txt
+.\deploy\scripts\create-free-mongo.ps1 -ResourceGroup rg-doraemon-be-dev -Location eastasia
+```
+
+也可以在 Azure 门户创建 **Azure DocumentDB Free Tier**，Networking 中允许 Azure 服务访问（`0.0.0.0` 规则），然后复制完整 `mongodb+srv://...` 串。
+
 2. 运行：
 
 ```powershell
-# 默认：应用 + 复用已有数据库；MONGODB_CONNECTION_STRING 会被隐藏输入
+# 默认：应用 + 复用已有数据库。存在 .secrets/mongo-connection-string.txt 时自动使用，否则隐藏输入
 .\deploy\scripts\deploy.ps1 -DeployCode -Location eastasia
 ```
 
 脚本会：
 1. 创建资源组（默认 `rg-doraemon-be-dev`）
-2. 部署 Bicep：App Service Plan（B1）、Web App（Node 24 LTS），不创建数据库
+2. 部署 Bicep：App Service Plan（默认 B1，可用 `-UseFreeAppServicePlan` 换成 F1）、Web App（Node 24 LTS），不创建数据库
 3. 把外部连接串、JWT 密钥、微信凭据写入 App Service 配置
 4. `-DeployCode` 时打包并通过 Zip 部署；App Service 的 Oryx 构建会执行 `npm install && npm run build`，然后用 `npm start` 启动 `dist/main.js`
+
+脚本先用本地 Bicep CLI 把 `.bicep`/`.bicepparam` 编译成 ARM JSON，再交给 `az`，因此不依赖 `az bicep`（后者会从 GitHub Releases 下载，某些网络下不可达）。部署前可先做一次不创建资源的预检：
+
+```powershell
+.\deploy\scripts\deploy.ps1 -ValidateOnly -UseFreeAppServicePlan -Location eastasia
+```
 
 #### 方式 B：Bicep 创建付费 DocumentDB 集群
 
@@ -183,7 +206,25 @@ winget install --id Microsoft.AzureCLI -e
 
 `JWT_SECRET` 与 `MONGO_ADMIN_PASSWORD` 未设置时会自动生成并打印一次；微信凭据未设置时会交互式询问（AppSecret 隐藏输入）。也可以提前设置同名环境变量，或直接传 `-MongoConnectionString '<url>'`（会进入命令行历史，不推荐）。
 
-资源命名默认 `<appName>-<env>-<hash>`；可用参数文件覆盖。费用参考：B1 App Service + M10 DocumentDB 是最低成本组合。
+#### 方式 C：App Service 也用 Free（F1）
+
+```powershell
+# 复用免费层数据库 + 免费层 App Service（当前阶段最省钱）
+.\deploy\scripts\deploy.ps1 -DeployCode -Location eastasia -UseFreeAppServicePlan
+```
+
+F1 的关键限制：
+
+- **60 CPU 分钟/天**，用完后当天不再提供服务；1 GB 内存，单实例，无自动伸缩。
+- **不支持 Always On**：闲置约 20 分钟后应用会卸载，下一次请求触发冷启动（Nest 启动 + Mongo 连接通常数秒）。
+- **自定义域名为 0**：只能访问 `*.azurewebsites.net`。小程序正式版要求已备案的合法域名，而 `azurewebsites.net` 无法完成大陆备案，所以 **上架前必须升级**（开发/调试阶段可在开发者工具里临时勾选“不校验合法域名”）。
+- Health check 在 Free 档可用，但没有实例替换能力；本模板在 F1 下会自动关闭 `healthCheckPath`，避免每分钟探测反复唤醒应用、消耗 CPU 配额。
+- 免费层的「WP stop requests」约为 **15 次/天**；反复部署失败或站点反复重启会触发 `QuotaExceeded`，此时可等待 UTC 零点重置，或删除重建 App Service（数据库不受影响）。
+- 无备份、无部署槽位、无 VNet 集成。
+
+适合开发、体验版调试和小流量自用。正式发布前去掉 `-UseFreeAppServicePlan` 重新执行一次部署即可原地升级到 B1，数据库连接串和代码都不用变。
+
+资源命名默认 `<appName>-<env>-<hash>`；可用参数文件覆盖。费用参考：App Service B1（约 $13/月）+ M10 DocumentDB 是最低付费组合；F1 + DocumentDB Free Tier 可做到零费用。
 
 ### 2. 验证
 

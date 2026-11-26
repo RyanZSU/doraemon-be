@@ -7,8 +7,9 @@ param environment = 'dev'
 param location = readEnvironmentVariable('AZURE_LOCATION', 'eastasia')
 param appName = 'doraemon-be'
 
-param appServiceSkuName = 'B1'
-param appServiceSkuTier = 'Basic'
+// B1/Basic by default; the deploy script can set F1/Free via -UseFreeAppServicePlan.
+param appServiceSkuName = readEnvironmentVariable('APP_SERVICE_SKU', 'B1')
+param appServiceSkuTier = readEnvironmentVariable('APP_SERVICE_TIER', 'Basic')
 
 // Paid mode: also creates the DocumentDB cluster.
 param provisionMongoCluster = true

@@ -10,8 +10,9 @@ param environment = 'dev'
 param location = readEnvironmentVariable('AZURE_LOCATION', 'eastasia')
 param appName = 'doraemon-be'
 
-param appServiceSkuName = 'B1'
-param appServiceSkuTier = 'Basic'
+// B1/Basic by default; the deploy script can set F1/Free via -UseFreeAppServicePlan.
+param appServiceSkuName = readEnvironmentVariable('APP_SERVICE_SKU', 'B1')
+param appServiceSkuTier = readEnvironmentVariable('APP_SERVICE_TIER', 'Basic')
 
 param provisionMongoCluster = false
 param externalMongoConnectionString = readEnvironmentVariable('MONGODB_CONNECTION_STRING')

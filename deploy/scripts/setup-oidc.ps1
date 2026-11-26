@@ -9,7 +9,6 @@ param(
     [string]$DisplayName = 'doraemon-be-github-actions'
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
