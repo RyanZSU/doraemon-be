@@ -5,7 +5,7 @@
 - **技术栈**：NestJS 12（TypeScript，ESM）+ Mongoose 9 + JWT
 - **数据库**：Azure DocumentDB（MongoDB vCore，原 Azure Cosmos DB for MongoDB vCore）
 - **部署**：Azure App Service（Linux，Node 24 LTS）+ Bicep + GitHub Actions（OIDC）
-- **本地**：Node.js ≥ 22.22.3、npm；可选 Docker（本地 MongoDB）
+- **本地**：Node.js 24 LTS（≥ 22.22.3，见 `.nvmrc`）、npm；可选 Docker（本地 MongoDB）
 
 ## 架构
 
@@ -171,7 +171,7 @@ winget install --id Microsoft.AzureCLI -e
 - **区域选择**：应用和数据库放在同一区域。面向中国大陆用户的微信接口，`eastasia`（香港）或 `japaneast` 延迟通常更低。Azure 全球版到 `api.weixin.qq.com` 可直连；Azure 中国区是独立订阅/云环境，需单独评估。
 - **Free Tier 区域限制**：DocumentDB 免费层目前仅支持部分区域，亚太区为 **East Asia、Japan East、Japan West**（另有澳洲、印度等）。**Southeast Asia 不在免费层支持列表中**；如果坚持部署到 Southeast Asia，数据库必须使用付费档。
 
-### 1. 部署（二选一）
+### 1. 部署（选择一种方式）
 
 #### 方式 A：复用 DocumentDB Free Tier 连接串（当前推荐）
 
@@ -197,9 +197,9 @@ winget install --id Microsoft.AzureCLI -e
 1. 创建资源组（默认 `rg-doraemon-be-dev`）
 2. 部署 Bicep：App Service Plan（默认 B1，可用 `-UseFreeAppServicePlan` 换成 F1）、Web App（Node 24 LTS），不创建数据库
 3. 把外部连接串、JWT 密钥、微信凭据写入 App Service 配置
-4. `-DeployCode` 时打包并通过 Zip 部署；App Service 的 Oryx 构建会执行 `npm install && npm run build`，然后用 `npm start` 启动 `dist/main.js`
+4. `-DeployCode` 时打包并通过 Zip 部署；App Service 的 Oryx 构建会执行 `npm install && npm run build`，然后由平台默认执行 `npm start` 启动 `dist/main.js`。模板已设置 `NPM_CONFIG_PRODUCTION=false`，确保构建阶段安装 devDependencies（否则 `nest build` 会报 `nest: not found`）。
 
-脚本先用本地 Bicep CLI 把 `.bicep`/`.bicepparam` 编译成 ARM JSON，再交给 `az`，因此不依赖 `az bicep`（后者会从 GitHub Releases 下载，某些网络下不可达）。部署前可先做一次不创建资源的预检：
+脚本先用本地 Bicep CLI 把 `.bicep`/`.bicepparam` 编译成 ARM JSON，再交给 `az`，因此不依赖 `az bicep`（后者会从 GitHub Releases 下载，某些网络下不可达）。部署前可先做一次预检（不部署资源；资源组不存在时会先创建）：
 
 ```powershell
 .\deploy\scripts\deploy.ps1 -ValidateOnly -UseFreeAppServicePlan -Location eastasia
@@ -212,7 +212,7 @@ winget install --id Microsoft.AzureCLI -e
 .\deploy\scripts\deploy.ps1 -CreateMongoCluster -DeployCode -Location eastasia
 ```
 
-`JWT_SECRET` 与 `MONGO_ADMIN_PASSWORD` 未设置时会自动生成并打印一次；微信凭据未设置时会交互式询问（AppSecret 隐藏输入）。也可以提前设置同名环境变量，或直接传 `-MongoConnectionString '<url>'`（会进入命令行历史，不推荐）。
+`JWT_SECRET` 与 `MONGO_ADMIN_PASSWORD` 未设置时会自动生成并打印一次；微信凭据按「环境变量 > `.secrets/weixin.txt` > 交互输入」读取。也可以提前设置同名环境变量，或直接传 `-MongoConnectionString '<url>'`（会进入命令行历史，不推荐）。
 
 #### 方式 C：App Service 也用 Free（F1）
 
@@ -241,7 +241,7 @@ curl https://<app>.azurewebsites.net/api/health/live
 curl https://<app>.azurewebsites.net/api/health
 ```
 
-App Service 已设置健康检查路径 `/api/health`，数据库不可用时返回 503。
+健康检查接口始终可用：`/api/health` 在数据库不可用时返回 503。B1 及以上档位会把 `/api/health` 配置为 App Service 健康探测；F1 下不配置，避免探测反复唤醒应用、消耗 CPU 配额。
 
 ### 3. 配置 GitHub Actions（OIDC，无长期密钥）
 
@@ -263,6 +263,14 @@ App Service 已设置健康检查路径 `/api/health`，数据库不可用时返
 - `wx.request` 的合法域名必须是 **HTTPS**，不能带端口；把它指向 App Service 的域名或绑定到 App Service 的自定义域名。
 - 若使用默认的 `*.azurewebsites.net` 域名，中国大陆主体的小程序域名备案通常无法通过；建议在 App Service 绑定自有域名并完成备案。
 - 登录页同时调用 `wx.login()` 与 `<button open-type="getPhoneNumber">`，把两个 code 发给 `/api/auth/login`。
+
+### 5. 常见部署问题
+
+- **`QuotaExceeded`（F1）**：通常是「WP stop requests」超限（约 15 次/天），由反复部署失败/重启导致。等待 UTC 零点重置，或删除重建 App Service；数据库不受影响。
+- **Oryx 报 `nest: not found`**：构建阶段没有安装 devDependencies。保持 App Service 配置 `NPM_CONFIG_PRODUCTION=false`（模板已设置）。
+- **部署成功后短暂返回 404 / 默认欢迎页**：F1 冷启动或站点重启中，等待 10–60 秒再请求 `/api/health/live`。若持续如此，查看部署日志确认 `src/` 是否进入 wwwroot。
+- **`az` 报 `Status_NoNetwork`**：本机 Azure CLI 登录态需要刷新，重新执行 `az login`；用 `curl https://management.azure.com/` 可区分网络问题。
+- **小程序调用失败**：确认 App Service 的 `WECHAT_APP_ID` / `WECHAT_APP_SECRET` 是真实值（占位值会让 `/api/auth/login` 返回 502），以及 DocumentDB 防火墙允许 Azure 服务访问。
 
 ## 新增一个工具模块
 
