@@ -160,7 +160,14 @@ winget install --id Microsoft.AzureCLI -e
 .\deploy\scripts\install-bicep.ps1
 ```
 
-- 准备微信小程序 `AppID` / `AppSecret`。
+- 准备微信小程序 `AppID` / `AppSecret`。可以写入 `.secrets/weixin.txt`（已 gitignore，支持 `KEY: VALUE`、`KEY=VALUE` 或 JSON 对象）：
+
+  ```
+  WECHAT_APP_ID: wx...
+  WECHAT_APP_SECRET: ...
+  ```
+
+  部署脚本的读取优先级：环境变量 > `.secrets/weixin.txt` > 交互输入（AppSecret 隐藏）。
 - **区域选择**：应用和数据库放在同一区域。面向中国大陆用户的微信接口，`eastasia`（香港）或 `japaneast` 延迟通常更低。Azure 全球版到 `api.weixin.qq.com` 可直连；Azure 中国区是独立订阅/云环境，需单独评估。
 - **Free Tier 区域限制**：DocumentDB 免费层目前仅支持部分区域，亚太区为 **East Asia、Japan East、Japan West**（另有澳洲、印度等）。**Southeast Asia 不在免费层支持列表中**；如果坚持部署到 Southeast Asia，数据库必须使用付费档。
 
@@ -181,7 +188,8 @@ winget install --id Microsoft.AzureCLI -e
 2. 运行：
 
 ```powershell
-# 默认：应用 + 复用已有数据库。存在 .secrets/mongo-connection-string.txt 时自动使用，否则隐藏输入
+# 默认：应用 + 复用已有数据库。存在 .secrets/mongo-connection-string.txt 时自动使用，否则隐藏输入。
+# 微信凭据优先读取 .secrets/weixin.txt，找不到才交互输入。
 .\deploy\scripts\deploy.ps1 -DeployCode -Location eastasia
 ```
 

@@ -9,6 +9,9 @@ param(
     [string]$MongoConnectionString = '',
     # Optional path to bicep.exe (otherwise discovered from PATH / %LOCALAPPDATA%\doraemon-be).
     [string]$BicepPath = '',
+    # Optional WeChat credentials file; defaults to .secrets\weixin.txt.
+    # Lines can be "KEY: VALUE", "KEY=VALUE" or a JSON object.
+    [string]$WeixinSecretsFile = '',
     # Create a paid DocumentDB cluster with Bicep instead of reusing an existing connection string.
     [switch]$CreateMongoCluster,
     # Use the App Service Free plan (F1, 60 CPU min/day, no Always On, no custom domain).
@@ -57,6 +60,54 @@ function New-RandomSecret {
     finally {
         $rng.Dispose()
     }
+}
+
+function Import-EnvFileKeys {
+    param(
+        [string]$Path,
+        [string[]]$Keys
+    )
+    $values = @{}
+    if (-not (Test-Path $Path)) {
+        return $values
+    }
+
+    $raw = Get-Content -Path $Path -Raw
+    if ($raw.TrimStart().StartsWith('{')) {
+        try {
+            $json = $raw | ConvertFrom-Json
+            foreach ($key in $Keys) {
+                $property = $json.PSObject.Properties[$key]
+                if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    $values[$key] = ([string]$property.Value).Trim()
+                }
+            }
+            return $values
+        }
+        catch {
+            # Not valid JSON; fall back to key/value parsing below.
+        }
+    }
+
+    foreach ($line in ($raw -split "\r?\n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '' -or $trimmed.StartsWith('#')) {
+            continue
+        }
+        if ($trimmed -match '^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*)$') {
+            $name = $Matches[1]
+            $value = $Matches[2].Trim()
+            if ($value.Length -ge 2 -and
+                (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+                 ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+            if (($Keys -contains $name) -and -not [string]::IsNullOrWhiteSpace($value)) {
+                $values[$name] = $value
+            }
+        }
+    }
+    return $values
 }
 
 function New-ZipPackage {
@@ -169,6 +220,20 @@ else {
     $conn = [Environment]::GetEnvironmentVariable('MONGODB_CONNECTION_STRING', 'Process')
     if ($conn -notmatch '^mongodb(\+srv)?://') {
         throw 'MongoDB connection string must start with mongodb:// or mongodb+srv://'
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($WeixinSecretsFile)) {
+    $WeixinSecretsFile = Join-Path $repoRoot '.secrets\weixin.txt'
+}
+if (Test-Path $WeixinSecretsFile) {
+    $weixinValues = Import-EnvFileKeys -Path $WeixinSecretsFile -Keys @('WECHAT_APP_ID', 'WECHAT_APP_SECRET')
+    foreach ($key in @('WECHAT_APP_ID', 'WECHAT_APP_SECRET')) {
+        $current = [Environment]::GetEnvironmentVariable($key, 'Process')
+        if ([string]::IsNullOrWhiteSpace($current) -and $weixinValues.ContainsKey($key)) {
+            [Environment]::SetEnvironmentVariable($key, $weixinValues[$key], 'Process')
+            Write-Host "Using $key from $WeixinSecretsFile"
+        }
     }
 }
 
