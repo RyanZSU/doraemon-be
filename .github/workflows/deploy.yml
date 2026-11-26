@@ -3,8 +3,9 @@ name: Deploy to Azure App Service
 on:
   push:
     branches: [main]
-    # Docs-only pushes do not need a new deployment. Pushing this workflow file
-    # (or app code) triggers a deploy; use workflow_dispatch for anything else.
+    # Docs-only pushes do not need a new deployment. App code, deployment
+    # tooling and this workflow trigger a deploy; use workflow_dispatch for
+    # anything else.
     paths:
       - 'src/**'
       - 'package.json'
@@ -12,6 +13,7 @@ on:
       - 'tsconfig.json'
       - 'tsconfig.build.json'
       - 'nest-cli.json'
+      - 'deploy/**'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
