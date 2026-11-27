@@ -1,18 +1,21 @@
+import { BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import type { Model } from 'mongoose';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type {
-  UserDocument,
-  UserStatus,
-} from '../users/schemas/user.schema.js';
+import type { InviteDocument } from '../invites/schemas/invite.schema.js';
+import type { InvitesService } from '../invites/invites.service.js';
+import type { UserDocument, UserStatus } from '../users/schemas/user.schema.js';
 import { AuthService } from './auth.service.js';
 import type { LoginDto } from './dto/login.dto.js';
+import { LoginAttemptService } from './login-attempt.service.js';
+import { hashPassword } from './password.js';
 import type { WechatService } from './wechat.service.js';
 
 interface UserDocStub {
   _id: { toString(): string };
   phone?: string;
+  passwordHash?: string;
   status: UserStatus;
   createdAt: Date;
   lastLoginAt: Date | null;
@@ -38,6 +41,20 @@ function createUserDoc(overrides: Partial<UserDocStub> = {}): UserDocument {
   return doc as unknown as UserDocument;
 }
 
+function createInviteStub(): InviteDocument {
+  return {
+    _id: { toString: () => 'invite-1' },
+  } as unknown as InviteDocument;
+}
+
+function stubFindOne(user: UserDocument | null) {
+  return {
+    select: vi.fn().mockReturnValue({
+      exec: vi.fn().mockResolvedValue(user),
+    }),
+  };
+}
+
 const loginDto: LoginDto = {
   code: 'wx-login-code',
   phoneCode: 'wx-phone-code',
@@ -48,6 +65,7 @@ const loginDto: LoginDto = {
 describe('AuthService', () => {
   let service: AuthService;
   let jwt: JwtService;
+  let attempts: LoginAttemptService;
   let userModel: {
     updateMany: ReturnType<typeof vi.fn>;
     findOne: ReturnType<typeof vi.fn>;
@@ -56,6 +74,11 @@ describe('AuthService', () => {
   let wechat: {
     code2Session: ReturnType<typeof vi.fn>;
     getPhoneNumber: ReturnType<typeof vi.fn>;
+  };
+  let invites: {
+    consume: ReturnType<typeof vi.fn>;
+    release: ReturnType<typeof vi.fn>;
+    markUsedBy: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -71,11 +94,20 @@ describe('AuthService', () => {
     };
 
     userModel = {
-      updateMany: vi.fn().mockReturnValue({ exec: vi.fn().mockResolvedValue({}) }),
+      updateMany: vi
+        .fn()
+        .mockReturnValue({ exec: vi.fn().mockResolvedValue({}) }),
       findOne: vi.fn(),
       create: vi.fn(),
     };
 
+    invites = {
+      consume: vi.fn(),
+      release: vi.fn().mockResolvedValue(undefined),
+      markUsedBy: vi.fn().mockResolvedValue(undefined),
+    };
+
+    attempts = new LoginAttemptService();
     jwt = new JwtService({
       secret: 'test-secret-that-is-long-enough-1234567890',
       signOptions: { expiresIn: 3600 },
@@ -87,12 +119,16 @@ describe('AuthService', () => {
       jwt,
       userModel as unknown as Model<UserDocument>,
       config,
+      invites as unknown as InvitesService,
+      attempts,
     );
   });
 
   it('creates a user keyed by the server-side verified phone number', async () => {
     const created = createUserDoc({ openid: 'openid-1' });
-    userModel.findOne.mockReturnValue({ exec: vi.fn().mockResolvedValue(null) });
+    userModel.findOne.mockReturnValue({
+      exec: vi.fn().mockResolvedValue(null),
+    });
     userModel.create.mockResolvedValue(created);
 
     const result = await service.login(loginDto);
@@ -151,7 +187,9 @@ describe('AuthService', () => {
 
   it('creates an openid-only account without any phone number', async () => {
     const created = createUserDoc({ phone: undefined, openid: 'openid-1' });
-    userModel.findOne.mockReturnValue({ exec: vi.fn().mockResolvedValue(null) });
+    userModel.findOne.mockReturnValue({
+      exec: vi.fn().mockResolvedValue(null),
+    });
     userModel.create.mockResolvedValue(created);
 
     const result = await service.wechatLogin({
@@ -212,5 +250,207 @@ describe('AuthService', () => {
     expect(result.isNewUser).toBe(false);
     // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
     expect(winner.save).toHaveBeenCalledOnce();
+  });
+
+  it('registers a phone + password account with a valid invite', async () => {
+    const invite = createInviteStub();
+    const created = createUserDoc({ nickname: '亲戚' });
+    invites.consume.mockResolvedValue(invite);
+    userModel.findOne.mockReturnValue(stubFindOne(null));
+    userModel.create.mockResolvedValue(created);
+
+    const result = await service.register(
+      {
+        inviteCode: 'abcd2345',
+        phone: '13800138000',
+        password: 'secret123',
+        nickname: '亲戚',
+      },
+      '203.0.113.5',
+    );
+
+    expect(invites.consume).toHaveBeenCalledWith('abcd2345');
+    expect(userModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phone: '13800138000',
+        nickname: '亲戚',
+        passwordHash: expect.stringMatching(/^scrypt\$/),
+        lastLoginAt: expect.any(Date),
+      }),
+    );
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(invites.markUsedBy).toHaveBeenCalledWith(invite._id, created._id);
+    expect(result.isNewUser).toBe(true);
+
+    const payload = await jwt.verifyAsync<{ sub: string; phone: string }>(
+      result.accessToken,
+    );
+    expect(payload).toMatchObject({ sub: 'user-1', phone: '13800138000' });
+  });
+
+  it('claims an existing passwordless phone account instead of rejecting it', async () => {
+    const invite = createInviteStub();
+    const existing = createUserDoc({ openid: 'openid-1' });
+    invites.consume.mockResolvedValue(invite);
+    userModel.findOne.mockReturnValue(stubFindOne(existing));
+
+    const result = await service.register(
+      {
+        inviteCode: 'abcd2345',
+        phone: '13800138000',
+        password: 'secret123',
+        nickname: '亲戚',
+      },
+      '203.0.113.5',
+    );
+
+    expect(result.isNewUser).toBe(false);
+    expect(existing.passwordHash).toMatch(/^scrypt\$/);
+    expect(existing.openid).toBe('openid-1');
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(existing.save).toHaveBeenCalledOnce();
+    expect(userModel.create).not.toHaveBeenCalled();
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(invites.markUsedBy).toHaveBeenCalledWith(invite._id, existing._id);
+  });
+
+  it('rejects a duplicate phone and releases the invite', async () => {
+    const invite = createInviteStub();
+    invites.consume.mockResolvedValue(invite);
+    userModel.findOne.mockReturnValue(stubFindOne(null));
+    userModel.create.mockRejectedValue({ code: 11000 });
+
+    await expect(
+      service.register(
+        {
+          inviteCode: 'abcd2345',
+          phone: '13800138000',
+          password: 'secret123',
+        },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '该手机号已注册' });
+
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(invites.release).toHaveBeenCalledWith(invite._id);
+  });
+
+  it('rejects an account that already has a password and releases the invite', async () => {
+    const invite = createInviteStub();
+    const existing = createUserDoc({ passwordHash: 'scrypt$existing' });
+    invites.consume.mockResolvedValue(invite);
+    userModel.findOne.mockReturnValue(stubFindOne(existing));
+
+    await expect(
+      service.register(
+        {
+          inviteCode: 'abcd2345',
+          phone: '13800138000',
+          password: 'secret123',
+        },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '该手机号已注册' });
+
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(invites.release).toHaveBeenCalledWith(invite._id);
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(existing.save).not.toHaveBeenCalled();
+  });
+
+  it('does not consume a user when the invite is invalid', async () => {
+    invites.consume.mockRejectedValue(
+      new BadRequestException('邀请码无效或已被使用'),
+    );
+
+    await expect(
+      service.register(
+        {
+          inviteCode: 'NOPE',
+          phone: '13800138000',
+          password: 'secret123',
+        },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '邀请码无效或已被使用' });
+
+    expect(userModel.create).not.toHaveBeenCalled();
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(invites.release).not.toHaveBeenCalled();
+  });
+
+  it('logs in with the correct password and updates lastLoginAt', async () => {
+    const passwordHash = await hashPassword('secret123');
+    const user = createUserDoc({ passwordHash });
+    userModel.findOne.mockReturnValue(stubFindOne(user));
+
+    const result = await service.passwordLogin(
+      { phone: '13800138000', password: 'secret123' },
+      '203.0.113.5',
+    );
+
+    expect(result.isNewUser).toBe(false);
+    expect(user.lastLoginAt).toBeInstanceOf(Date);
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(user.save).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a wrong password without revealing whether the phone exists', async () => {
+    const passwordHash = await hashPassword('secret123');
+    const user = createUserDoc({ passwordHash });
+    userModel.findOne.mockReturnValue(stubFindOne(user));
+
+    await expect(
+      service.passwordLogin(
+        { phone: '13800138000', password: 'wrongpass' },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '手机号或密码错误' });
+
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(user.save).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown phone number with the same generic error', async () => {
+    userModel.findOne.mockReturnValue(stubFindOne(null));
+
+    await expect(
+      service.passwordLogin(
+        { phone: '13900139000', password: 'secret123' },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '手机号或密码错误' });
+  });
+
+  it('rejects a disabled account after verifying the password', async () => {
+    const passwordHash = await hashPassword('secret123');
+    const user = createUserDoc({ passwordHash, status: 'disabled' });
+    userModel.findOne.mockReturnValue(stubFindOne(user));
+
+    await expect(
+      service.passwordLogin(
+        { phone: '13800138000', password: 'secret123' },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '账号已被禁用' });
+
+    // oxlint-disable-next-line typescript/unbound-method -- Vitest mock, no `this`
+    expect(user.save).not.toHaveBeenCalled();
+  });
+
+  it('rate-limits password attempts before hitting the database', async () => {
+    const phoneKey = 'login:phone:13800138000';
+    for (let i = 0; i < 5; i += 1) {
+      attempts.hit(phoneKey, 5, 15 * 60 * 1000);
+    }
+
+    await expect(
+      service.passwordLogin(
+        { phone: '13800138000', password: 'secret123' },
+        '203.0.113.5',
+      ),
+    ).rejects.toMatchObject({ message: '尝试次数过多，请稍后再试' });
+
+    expect(userModel.findOne).not.toHaveBeenCalled();
   });
 });

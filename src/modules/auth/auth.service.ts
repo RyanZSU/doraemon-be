@@ -1,13 +1,25 @@
-import { Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectModel } from '@nestjs/mongoose';
-import type { Model } from 'mongoose';
-import type { LoginDto } from './dto/login.dto.js';
-import type { WechatLoginDto } from './dto/wechat-login.dto.js';
+import type { Model, Types } from 'mongoose';
+import type { InviteDocument } from '../invites/schemas/invite.schema.js';
+import { InvitesService } from '../invites/invites.service.js';
 import { User, type UserDocument } from '../users/schemas/user.schema.js';
 import { toUserProfile } from '../users/user-profile.js';
 import type { LoginResult } from './auth.types.js';
+import type { LoginDto } from './dto/login.dto.js';
+import type { PasswordLoginDto } from './dto/password-login.dto.js';
+import type { RegisterDto } from './dto/register.dto.js';
+import type { WechatLoginDto } from './dto/wechat-login.dto.js';
+import { LoginAttemptService } from './login-attempt.service.js';
+import { getDummyHash, hashPassword, verifyPassword } from './password.js';
 import type { WechatSession } from './wechat.types.js';
 import { WechatService } from './wechat.service.js';
 
@@ -16,14 +28,24 @@ type ProfileFields = Pick<
   'nickname' | 'avatarUrl' | 'wechatId'
 >;
 
+const LOGIN_ATTEMPTS_PER_PHONE = 5;
+const LOGIN_ATTEMPTS_PER_IP = 30;
+const REGISTER_ATTEMPTS_PER_IP = 20;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly wechat: WechatService,
     private readonly jwt: JwtService,
     @InjectModel(User.name)
     private readonly userModel: Model<UserDocument>,
     private readonly config: ConfigService,
+    private readonly invites: InvitesService,
+    private readonly attempts: LoginAttemptService,
   ) {}
 
   /**
@@ -56,6 +78,131 @@ export class AuthService {
     );
 
     return this.issueToken(user, isNewUser);
+  }
+
+  /**
+   * Invite-gated registration for phone + password accounts. This is the
+   * client-agnostic account path shared by the Android app, iOS and a future
+   * published mini program.
+   *
+   * The phone here is a self-asserted account identifier, not a WeChat-verified
+   * number: there is no SMS verification, and holding a valid invite is the
+   * trust gate. WeChat phone login (`login`) still only accepts server-verified
+   * numbers.
+   */
+  async register(dto: RegisterDto, ip: string): Promise<LoginResult> {
+    this.attempts.hit(
+      `register:ip:${ip}`,
+      REGISTER_ATTEMPTS_PER_IP,
+      REGISTER_WINDOW_MS,
+    );
+
+    const invite = await this.invites.consume(dto.inviteCode);
+    try {
+      return await this.claimOrCreateAccount(dto, invite);
+    } catch (error) {
+      await this.invites.release(invite._id);
+      throw error;
+    }
+  }
+
+  async passwordLogin(dto: PasswordLoginDto, ip: string): Promise<LoginResult> {
+    const phoneKey = `login:phone:${dto.phone}`;
+    const ipKey = `login:ip:${ip}`;
+    this.attempts.hit(phoneKey, LOGIN_ATTEMPTS_PER_PHONE, LOGIN_WINDOW_MS);
+    this.attempts.hit(ipKey, LOGIN_ATTEMPTS_PER_IP, LOGIN_WINDOW_MS);
+
+    const user = await this.userModel
+      .findOne({ phone: dto.phone })
+      .select('+passwordHash')
+      .exec();
+
+    // Burn the same scrypt work even when the account does not exist, so the
+    // failure timing does not reveal which phone numbers are registered.
+    const storedHash = user?.passwordHash ?? (await getDummyHash());
+    const passwordMatches = await verifyPassword(dto.password, storedHash);
+
+    if (!user || !user.passwordHash || !passwordMatches) {
+      throw new UnauthorizedException('手机号或密码错误');
+    }
+
+    if (user.status !== 'active') {
+      throw new ForbiddenException('账号已被禁用');
+    }
+
+    this.attempts.clear(phoneKey);
+    this.attempts.clear(ipKey);
+    user.lastLoginAt = new Date();
+    await user.save();
+
+    return this.issueToken(user, false);
+  }
+
+  /**
+   * Claims an existing passwordless phone account (for example one created by
+   * the organisation-subject WeChat phone login) instead of rejecting it, so
+   * the account stays reachable from the app. Accounts that already have a
+   * password conflict.
+   */
+  private async claimOrCreateAccount(
+    dto: RegisterDto,
+    invite: InviteDocument,
+  ): Promise<LoginResult> {
+    const passwordHash = await hashPassword(dto.password);
+    const existing = await this.userModel
+      .findOne({ phone: dto.phone })
+      .select('+passwordHash')
+      .exec();
+
+    if (existing) {
+      if (existing.passwordHash) {
+        throw new ConflictException('该手机号已注册');
+      }
+      if (existing.status !== 'active') {
+        throw new ForbiddenException('账号已被禁用');
+      }
+
+      existing.passwordHash = passwordHash;
+      if (!existing.nickname && dto.nickname !== undefined) {
+        existing.nickname = dto.nickname;
+      }
+      existing.lastLoginAt = new Date();
+      await existing.save();
+      await this.recordInviteUsage(invite, existing._id);
+
+      return this.issueToken(existing, false);
+    }
+
+    let created: UserDocument;
+    try {
+      created = await this.userModel.create({
+        phone: dto.phone,
+        passwordHash,
+        ...(dto.nickname === undefined ? {} : { nickname: dto.nickname }),
+        lastLoginAt: new Date(),
+      });
+    } catch (error) {
+      if (isDuplicateKeyError(error)) {
+        // Lost a race with another registration for the same phone.
+        throw new ConflictException('该手机号已注册');
+      }
+      throw error;
+    }
+
+    await this.recordInviteUsage(invite, created._id);
+    return this.issueToken(created, true);
+  }
+
+  /** Invite usage metadata is useful but must not fail a registration. */
+  private async recordInviteUsage(
+    invite: InviteDocument,
+    userId: Types.ObjectId,
+  ): Promise<void> {
+    try {
+      await this.invites.markUsedBy(invite._id, userId);
+    } catch (error) {
+      this.logger.warn(`Failed to record invite usage: ${String(error)}`);
+    }
   }
 
   private async issueToken(

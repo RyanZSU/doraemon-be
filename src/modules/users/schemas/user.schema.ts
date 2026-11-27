@@ -18,6 +18,15 @@ export class User {
   @Prop({ trim: true })
   phone?: string;
 
+  /**
+   * scrypt hash for phone + password accounts (Android/iOS and future web).
+   * Never selected by default; password login opts in with
+   * `.select('+passwordHash')`. Not an identity field and never returned by
+   * `toUserProfile`.
+   */
+  @Prop({ select: false })
+  passwordHash?: string;
+
   @Prop({ unique: true, sparse: true, trim: true })
   openid?: string;
 

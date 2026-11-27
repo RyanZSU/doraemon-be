@@ -25,11 +25,17 @@ NestJS on Azure App Service ──► Azure DocumentDB (MongoDB vCore)
 可选：POST /api/auth/login（组织主体 + 已开通「获取手机号」权限）
   code + phoneCode -> stable_token + getuserphonenumber -> 服务端换取真实手机号
                     -> 按手机号 find-or-create 并绑定 openid
+
+Android / iOS（小程序未发布时的统一账号入口）
+  POST /api/auth/register       邀请码 + 手机号 + 密码
+  POST /api/auth/password-login 手机号 + 密码
 ```
 
 **为什么默认走 openid 静默登录**：微信的 `getPhoneNumber` 能力只对完成认证的组织主体开放，个人主体小程序无法调用。个人自用场景下 openid 已足够作为账号标识。手机号登录接口保留给后续升级为企业主体时使用。
 
-**为什么手机号必须由服务端获取**：小程序前端能拿到用户输入的任意内容，只有 `phoneCode` + 后端调用微信 `getuserphonenumber` 才能得到微信验证过的手机号。本项目不接受前端直接上传的手机号。
+**为什么微信登录的手机号必须由服务端获取**：小程序前端能拿到用户输入的任意内容，只有 `phoneCode` + 后端调用微信 `getuserphonenumber` 才能得到微信验证过的手机号。微信登录流程不接受前端直接上传的手机号。
+
+**手机号 + 密码账号**：Android（以及以后的 iOS）没有微信开放平台 App 登录权限，也暂时没有短信验证码签名来源，因此用**一次性邀请码**作为准入门槛：持有邀请码的人可以用自填手机号 + 自设密码注册一个账号，之后用手机号 + 密码登录。这里的手机号是**自填的账号标识，未经短信验证**；邀请码的持有关系就是信任门槛。这套账号以后可被发布上线的小程序直接复用。
 
 ## 目录结构
 
@@ -46,9 +52,11 @@ src/
     filters/                   统一异常响应
     middleware/request-id      X-Request-Id 透传/生成
   modules/
-    auth/                      微信登录、access_token 缓存、JWT 策略
+    auth/                      微信登录、手机号+密码、access_token 缓存、JWT 策略
+    invites/                   一次性邀请码（注册门槛）
     users/                     用户资料、User Schema
     health/                    /api/health（含 Mongo ping）、/api/health/live
+  scripts/create-invites.ts    本地生成邀请码（不暴露成 HTTP 接口）
 deploy/
   main.bicep                   资源组级入口
   modules/                     App Service、DocumentDB 集群
@@ -89,6 +97,7 @@ npm run start:dev
 | `npm test` | 单元测试（Vitest，不需要数据库） |
 | `npm run test:e2e` | e2e（需要 `MONGODB_URI`，否则自动跳过） |
 | `npm run lint` | oxlint（类型感知） |
+| `npm run invite:create -- --count 3 --note "亲戚"` | 生成一次性邀请码（需先 `npm run build`） |
 
 ## API
 
@@ -106,6 +115,8 @@ npm run start:dev
 | GET | `/api` | 否 | 服务信息 |
 | POST | `/api/auth/wechat-login` | 否 | **默认**：openid 静默登录/注册，返回 JWT |
 | POST | `/api/auth/login` | 否 | 可选：手机号登录/注册（需组织主体 + 手机号权限） |
+| POST | `/api/auth/register` | 否 | 邀请码 + 手机号 + 密码注册（Android/iOS 共用） |
+| POST | `/api/auth/password-login` | 否 | 手机号 + 密码登录 |
 | GET | `/api/users/me` | Bearer | 当前用户资料 |
 | PATCH | `/api/users/me` | Bearer | 更新昵称、头像、自填微信号 |
 | GET | `/api/health/live` | 否 | 存活检查（不查库） |
@@ -138,15 +149,52 @@ POST /api/auth/login
 }
 ```
 
-两个接口响应 `data` 一致：`accessToken`、`tokenType`、`expiresIn`、`isNewUser`、`user`（`user.phone` 与 `user.openid` 都可能为 `null`）。后续请求带上 `Authorization: Bearer <accessToken>`。
+所有登录/注册接口响应 `data` 一致：`accessToken`、`tokenType`、`expiresIn`、`isNewUser`、`user`（`user.phone` 与 `user.openid` 都可能为 `null`）。后续请求带上 `Authorization: Bearer <accessToken>`。
+
+### 注册 / 密码登录（Android、iOS、以后的小程序）
+
+```json
+POST /api/auth/register
+{
+  "inviteCode": "一次性邀请码",
+  "phone": "13800138000",
+  "password": "至少 8 位",
+  "nickname": "可选"
+}
+```
+
+```json
+POST /api/auth/password-login
+{
+  "phone": "13800138000",
+  "password": "注册时设置的密码"
+}
+```
+
+- 注册需要有效的、未使用、未过期的邀请码；注册失败（手机号已存在等）会自动释放邀请码。
+- 密码使用 Node 内置 `scrypt` 加盐哈希，只存 `passwordHash`，默认查询不返回该字段。
+- 手机号是自填账号标识，未经短信验证；邀请码的持有关系是信任门槛。
+- 若手机号已存在但没有密码（例如组织主体通过微信手机号登录创建的账号），注册会为该账号**补充密码**而不是报冲突；已有密码的账号返回 409。
+- 密码登录默认 5 次失败 / 15 分钟（按手机号）与 30 次 / 15 分钟（按 IP）限流，超限返回 429。限流为单实例内存实现。
+
+邀请码只在本机生成，不暴露成 HTTP 接口：
+
+```powershell
+npm run build
+npm run invite:create -- --count 3 --note "亲戚" --days 30
+```
+
+连接串依次读取 `--mongo-uri`、`MONGODB_URI`、`.env.local`/`.env`、`.secrets/mongo-connection-string.txt`；脚本只打印脱敏后的目标主机与库名。
 
 ### 账号规则
 
 - 默认账号标识是 **openid**（sparse unique），来自服务端 `jscode2session`，前端无法伪造。
-- `phone` 可选（sparse unique，索引名 `phone_sparse_unique`），仅手机号登录时由微信 `getuserphonenumber` 验证后写入。启动时 `UserIndexService.syncIndexes()` 会把旧版本非 sparse 的 `phone_1` 索引迁移掉，避免多个无手机号账号互相冲突。
+- `phone` 可选（sparse unique，索引名 `phone_sparse_unique`）。微信手机号登录时由 `getuserphonenumber` 验证后写入；邀请码注册时为用户自填。
+- `passwordHash` 可选（`select: false`），仅手机号 + 密码账号使用；不会出现在 `UserProfile` 或任何响应里。
+- 启动时 `UserIndexService.syncIndexes()` 会把旧版本非 sparse 的 `phone_1` 索引迁移掉，避免多个无手机号账号互相冲突。
 - 同一 openid 静默登录始终命中同一账号；手机号登录时，openid 会从旧手机号账号解绑并绑到新账号。
 - 微信号（WeChat ID）微信官方接口不返回，只能由用户自填，不能作为身份依据。
-- 手机号属于个人敏感信息，生产环境建议评估加密存储、日志脱敏与合规要求。
+- 手机号属于个人敏感信息，生产环境建议评估加密存储、日志脱敏与合规要求。密码账号的手机号未经短信验证，不能当作已验证身份使用。
 
 ## 环境变量
 

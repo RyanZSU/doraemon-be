@@ -13,6 +13,10 @@ rules, invariants and environment traps that are easy to get wrong.
   works for personal-subject mini programs. The phone-based `/auth/login`
   remains available for certified organisation subjects. Each future tool
   (check-in, diary, …) is added as a module.
+- Because the mini program is not published yet, Android (and a future iOS app)
+  use **invite-gated phone + password accounts** (`/auth/register`,
+  `/auth/password-login`). Phone + password is the client-agnostic account
+  path; WeChat openid stays an optional future binding.
 - Production runs on Azure App Service (Linux, Node 24 LTS) and connects to
   Azure DocumentDB (MongoDB vCore). Infrastructure is Bicep, CI/CD is GitHub
   Actions with OIDC.
@@ -28,6 +32,7 @@ npm test                 # Vitest unit tests, no database needed
 npm run test:e2e         # skipped automatically unless MONGODB_URI is set
 npm run lint             # oxlint --type-aware
 npm run format
+npm run invite:create -- --count 3 --note "family"  # needs npm run build first
 
 # Deployment dry run against Azure (no resources deployed; needs az login).
 # It may create the resource group if it does not exist yet.
@@ -49,9 +54,11 @@ src/app.module.ts               global JWT guard, response interceptor, exceptio
 src/config/env.validation.ts    Joi validation; startup fails on bad env
 src/database/database.module.ts global Mongoose connection
 src/common/                     @Public(), @CurrentUser(), guards, filters, interceptor
-src/modules/auth/               WeChat login, access_token cache, JWT strategy
+src/modules/auth/               WeChat + password login, access_token cache, JWT strategy
+src/modules/invites/            single-use invite codes for password registration
 src/modules/users/              user profile + User schema
 src/modules/health/             /api/health (Mongo ping), /api/health/live
+src/scripts/create-invites.ts   local-only invite generator (never an HTTP route)
 deploy/                         Bicep, parameter files, deploy/OIDC scripts
 ```
 
@@ -63,9 +70,22 @@ deploy/                         Bicep, parameter files, deploy/OIDC scripts
   `wx.login()` code; `jscode2session` supplies the openid used as the account
   key. Phone login (`/auth/login`) is opt-in for certified organisation
   subjects, since personal subjects cannot use `getPhoneNumber`.
-- Never accept a phone number from the client. The phone must come from
-  `phoneCode` → WeChat `getuserphonenumber` on the server. `AuthService.login`
-  already enforces this.
+- **WeChat login** never accepts a phone number from the client. The phone must
+  come from `phoneCode` → WeChat `getuserphonenumber` on the server.
+  `AuthService.login` already enforces this.
+- **Invite-gated phone + password accounts are the deliberate exception**:
+  `POST /auth/register` does accept a self-asserted phone as an account
+  identifier because there is no SMS/WeChat verification. It must require a
+  valid, unused, unexpired invite; never treat that phone as verified and never
+  use it as proof of identity.
+- Password accounts store only `passwordHash` (Node `crypto.scrypt`,
+  `select: false`). Never return it, log it, or add it to `UserProfile`.
+  `passwordLogin` returns a generic 401 for unknown phone/wrong password, and
+  counts attempts before the DB/password work (429 after the limit).
+- Invites are single-use and expiring; consumption is atomic
+  (`findOneAndUpdate` with `usedAt: null`). Registration must release the invite
+  when account creation fails. Invite issuance is CLI-only
+  (`src/scripts/create-invites.ts`), never an HTTP endpoint.
 - Never store or return `session_key`; it is not needed.
 - `phone` is optional with a sparse unique index (`phone_sparse_unique`);
   `openid` is unique + sparse too. Keep both sparse — openid-only accounts have
@@ -160,7 +180,9 @@ deploy/                         Bicep, parameter files, deploy/OIDC scripts
   mini programs cannot use it. Keep `/auth/wechat-login` as the default.
 - Don't make `phone` required again or drop the sparse index options; that
   breaks openid-only accounts.
-- Don't trust or persist client-provided phone numbers or WeChat IDs.
+- Don't trust client-provided phone numbers in WeChat flows or treat any phone
+  as verified. The invite-gated password path may persist a self-asserted phone
+  as an account identifier; WeChat IDs remain untrusted everywhere.
 - Don't add broad e2e suites that require a live database; unit tests should
   stay hermetic and e2e stays opt-in via `MONGODB_URI`.
 - Don't deploy with placeholder WeChat credentials or a test JWT secret.
