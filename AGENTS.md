@@ -8,8 +8,11 @@ rules, invariants and environment traps that are easy to get wrong.
 
 - NestJS 12 backend for a WeChat mini program ("家用百宝箱"), TypeScript (ESM),
   Mongoose 9, JWT auth.
-- Users log in with WeChat; the **server-verified phone number** is the account
-  identity. Each future tool (check-in, diary, …) is added as a module.
+- Users log in with WeChat. **Silent login (`/auth/wechat-login`) is the
+  default**: the openid from `jscode2session` is the account identity, which
+  works for personal-subject mini programs. The phone-based `/auth/login`
+  remains available for certified organisation subjects. Each future tool
+  (check-in, diary, …) is added as a module.
 - Production runs on Azure App Service (Linux, Node 24 LTS) and connects to
   Azure DocumentDB (MongoDB vCore). Infrastructure is Bicep, CI/CD is GitHub
   Actions with OIDC.
@@ -56,17 +59,25 @@ deploy/                         Bicep, parameter files, deploy/OIDC scripts
 
 **Identity and auth**
 
+- Silent login (`/auth/wechat-login`) is the default. It needs only the
+  `wx.login()` code; `jscode2session` supplies the openid used as the account
+  key. Phone login (`/auth/login`) is opt-in for certified organisation
+  subjects, since personal subjects cannot use `getPhoneNumber`.
 - Never accept a phone number from the client. The phone must come from
   `phoneCode` → WeChat `getuserphonenumber` on the server. `AuthService.login`
   already enforces this.
 - Never store or return `session_key`; it is not needed.
-- `openid` is unique (sparse index). When a WeChat user logs in with a different
-  phone, the openid is detached from the old account before being bound to the
-  new one. Keep that behaviour.
+- `phone` is optional with a sparse unique index (`phone_sparse_unique`);
+  `openid` is unique + sparse too. Keep both sparse — openid-only accounts have
+  no phone. `UserIndexService.syncIndexes()` migrates the legacy non-sparse
+  `phone_1` index on startup; do not remove it.
+- For phone login, when the same openid uses a different phone, the openid is
+  detached from the old account before being bound to the new one.
 - `wechatId` is self-reported; it is not an identity and cannot be verified.
 - All routes require a Bearer JWT unless explicitly marked `@Public()`. Add
   `@Public()` only for endpoints that genuinely need anonymous access.
-- The JWT payload is `{ sub: userId, phone }`; `@CurrentUser()` exposes it.
+- The JWT payload is `{ sub: userId, phone, openid }`, with nullable phone and
+  openid; `@CurrentUser()` exposes it.
 
 **API shape**
 
@@ -145,7 +156,10 @@ deploy/                         Bicep, parameter files, deploy/OIDC scripts
 
 ## Don't
 
-- Don't change the phone-as-identity model without an explicit product decision.
+- Don't require `getPhoneNumber` for the default login path — personal-subject
+  mini programs cannot use it. Keep `/auth/wechat-login` as the default.
+- Don't make `phone` required again or drop the sparse index options; that
+  breaks openid-only accounts.
 - Don't trust or persist client-provided phone numbers or WeChat IDs.
 - Don't add broad e2e suites that require a live database; unit tests should
   stay hermetic and e2e stays opt-in via `MONGODB_URI`.

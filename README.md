@@ -12,18 +12,22 @@
 ```
 微信小程序
   │  wx.login() -> code
-  │  open-type="getPhoneNumber" -> phoneCode
   ▼
-POST /api/auth/login
+POST /api/auth/wechat-login         ← 默认：静默登录，个人主体小程序可用
   │
-  ├─ jscode2session(code)               -> openid / unionid
-  ├─ stable_token + getuserphonenumber(phoneCode) -> 真实手机号（服务端换取）
-  ├─ users 集合按手机号 find-or-create，绑定 openid
+  ├─ jscode2session(code)           -> openid / unionid
+  ├─ users 集合按 openid find-or-create（无需手机号）
   └─ 签发 JWT (7d)
   ▼
 NestJS on Azure App Service ──► Azure DocumentDB (MongoDB vCore)
                                 mongodb+srv://...mongocluster.cosmos.azure.com
+
+可选：POST /api/auth/login（组织主体 + 已开通「获取手机号」权限）
+  code + phoneCode -> stable_token + getuserphonenumber -> 服务端换取真实手机号
+                    -> 按手机号 find-or-create 并绑定 openid
 ```
+
+**为什么默认走 openid 静默登录**：微信的 `getPhoneNumber` 能力只对完成认证的组织主体开放，个人主体小程序无法调用。个人自用场景下 openid 已足够作为账号标识。手机号登录接口保留给后续升级为企业主体时使用。
 
 **为什么手机号必须由服务端获取**：小程序前端能拿到用户输入的任意内容，只有 `phoneCode` + 后端调用微信 `getuserphonenumber` 才能得到微信验证过的手机号。本项目不接受前端直接上传的手机号。
 
@@ -100,13 +104,28 @@ npm run start:dev
 | 方法 | 路径 | 鉴权 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/api` | 否 | 服务信息 |
-| POST | `/api/auth/login` | 否 | 微信登录/注册，返回 JWT |
+| POST | `/api/auth/wechat-login` | 否 | **默认**：openid 静默登录/注册，返回 JWT |
+| POST | `/api/auth/login` | 否 | 可选：手机号登录/注册（需组织主体 + 手机号权限） |
 | GET | `/api/users/me` | Bearer | 当前用户资料 |
 | PATCH | `/api/users/me` | Bearer | 更新昵称、头像、自填微信号 |
 | GET | `/api/health/live` | 否 | 存活检查（不查库） |
 | GET | `/api/health` | 否 | 就绪检查（Mongo ping，失败返回 503） |
 
-### 登录请求
+### 登录请求（默认：静默登录）
+
+```json
+POST /api/auth/wechat-login
+{
+  "code": "wx.login() 返回的 code",
+  "nickname": "可选",
+  "avatarUrl": "可选",
+  "wechatId": "可选，用户自填"
+}
+```
+
+后端用 `jscode2session` 换取 openid，按 openid find-or-create，不依赖任何手机号能力，个人主体小程序可用。
+
+### 登录请求（可选：手机号登录）
 
 ```json
 POST /api/auth/login
@@ -119,12 +138,13 @@ POST /api/auth/login
 }
 ```
 
-响应 `data`：`accessToken`、`tokenType`、`expiresIn`、`isNewUser`、`user`。后续请求带上 `Authorization: Bearer <accessToken>`。
+两个接口响应 `data` 一致：`accessToken`、`tokenType`、`expiresIn`、`isNewUser`、`user`（`user.phone` 与 `user.openid` 都可能为 `null`）。后续请求带上 `Authorization: Bearer <accessToken>`。
 
 ### 账号规则
 
-- 用户标识是**手机号**，手机号由微信服务端接口验证。
-- `openid` 全局唯一（sparse unique）。同一微信用户换手机号登录时，`openid` 会从旧账号解绑并绑到新手机号账号。
+- 默认账号标识是 **openid**（sparse unique），来自服务端 `jscode2session`，前端无法伪造。
+- `phone` 可选（sparse unique，索引名 `phone_sparse_unique`），仅手机号登录时由微信 `getuserphonenumber` 验证后写入。启动时 `UserIndexService.syncIndexes()` 会把旧版本非 sparse 的 `phone_1` 索引迁移掉，避免多个无手机号账号互相冲突。
+- 同一 openid 静默登录始终命中同一账号；手机号登录时，openid 会从旧手机号账号解绑并绑到新账号。
 - 微信号（WeChat ID）微信官方接口不返回，只能由用户自填，不能作为身份依据。
 - 手机号属于个人敏感信息，生产环境建议评估加密存储、日志脱敏与合规要求。
 
@@ -268,7 +288,8 @@ curl https://<app>.azurewebsites.net/api/health
 
 - `wx.request` 的合法域名必须是 **HTTPS**，不能带端口；把它指向 App Service 的域名或绑定到 App Service 的自定义域名。
 - 若使用默认的 `*.azurewebsites.net` 域名，中国大陆主体的小程序域名备案通常无法通过；建议在 App Service 绑定自有域名并完成备案。
-- 登录页同时调用 `wx.login()` 与 `<button open-type="getPhoneNumber">`，把两个 code 发给 `/api/auth/login`。
+- 登录页调用 `wx.login()`，把 code 发给 `/api/auth/wechat-login`（静默登录）。若后续升级为组织主体并开通手机号权限，可切到 `/api/auth/login` + `getPhoneNumber`。
+- 前端工程在 `doraemon-app/`，`utils/config.js` 已写入当前 App Service 域名；也可在小程序「我的 → 服务设置」里随时修改。
 
 ### 5. 常见部署问题
 

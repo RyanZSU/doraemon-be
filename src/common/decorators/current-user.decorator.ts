@@ -10,7 +10,7 @@ export const CurrentUser = createParamDecorator(
   (
     field: keyof AuthenticatedUser | undefined,
     ctx: ExecutionContext,
-  ): AuthenticatedUser | string | undefined => {
+  ): AuthenticatedUser | string | null | undefined => {
     const request = ctx.switchToHttp().getRequest<Request>();
     const user = request.user as AuthenticatedUser | undefined;
     return field ? user?.[field] : user;

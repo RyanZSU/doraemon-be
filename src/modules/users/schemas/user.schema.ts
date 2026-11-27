@@ -5,14 +5,18 @@ export const USER_STATUSES = ['active', 'disabled'] as const;
 export type UserStatus = (typeof USER_STATUSES)[number];
 
 /**
- * A user is identified by their phone number (retrieved from WeChat on the
- * server, never trusted from the client). The WeChat openid is a credential
- * that can be re-bound when a user changes phone number.
+ * Accounts can be created in two ways:
+ * - Phone login: the server-verified phone number is the account key. This
+ *   requires an organisation subject with getPhoneNumber permission.
+ * - Silent login: only the WeChat openid is available (personal subjects).
+ *
+ * Phone is therefore optional. Both keys are unique + sparse so multiple
+ * openid-only accounts do not collide on a missing phone value.
  */
 @Schema({ timestamps: true, collection: 'users', versionKey: false })
 export class User {
-  @Prop({ required: true, unique: true, trim: true })
-  phone!: string;
+  @Prop({ trim: true })
+  phone?: string;
 
   @Prop({ unique: true, sparse: true, trim: true })
   openid?: string;
@@ -41,4 +45,15 @@ export class User {
 }
 
 export type UserDocument = HydratedDocument<User>;
+
 export const UserSchema = SchemaFactory.createForClass(User);
+
+/**
+ * An explicit index name avoids IndexOptionsConflict with the legacy
+ * non-sparse `phone_1` index created by earlier deployments. UserIndexService
+ * calls syncIndexes() on startup to drop stale indexes.
+ */
+UserSchema.index(
+  { phone: 1 },
+  { unique: true, sparse: true, name: 'phone_sparse_unique' },
+);
