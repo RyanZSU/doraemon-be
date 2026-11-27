@@ -111,6 +111,21 @@ jobs:
           app-name: ${{ vars.AZURE_WEBAPP_NAME }}
           package: app
 
+      # Zip deploy replaces wwwroot, but the running Node process can keep
+      # serving the previous build (Nest registers routes at startup). Without
+      # this restart a deployment can report success while /api/health still
+      # answers from the old code and new routes return 404.
+      - name: Restart app to load the new build
+        env:
+          APP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+        run: |
+          RG=$(az webapp list --query "[?name=='$APP_NAME'].resourceGroup | [0]" -o tsv)
+          if [ -z "$RG" ]; then
+            echo "::error::Could not resolve the resource group for $APP_NAME"
+            exit 1
+          fi
+          az webapp restart --name "$APP_NAME" --resource-group "$RG"
+
       # F1 cold starts and Oryx builds can take a minute or two. Fail the
       # workflow if the app never becomes healthy (DB connectivity included).
       - name: Verify health endpoint
@@ -131,3 +146,19 @@ jobs:
           echo "::error::Deployment did not become healthy within 3 minutes."
           cat /tmp/health.json 2>/dev/null || true
           exit 1
+
+      # Health alone cannot prove the new build is running: /api/health also
+      # exists in the old build. A 404 on the silent-login route means the old
+      # process is still serving requests, so fail instead of a false green.
+      - name: Verify deployed code is live
+        env:
+          APP_URL: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net
+        run: |
+          status=$(curl -s -o /tmp/login-probe.json -w '%{http_code}' \
+            --max-time 30 -X POST "$APP_URL/api/auth/wechat-login" \
+            -H 'Content-Type: application/json' -d '{"code":"ci-probe"}')
+          if [ "$status" = "404" ]; then
+            echo "::error::Old build is still serving requests (silent-login route is 404)"
+            exit 1
+          fi
+          echo "Silent-login route answered HTTP $status; the new build is live."
